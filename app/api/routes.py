@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.core.orchestrator import Orchestrator
+from app.core.orchestrator import Orchestrator, job_store
 
 router = APIRouter()
 
@@ -16,11 +16,16 @@ class ChatRequest(BaseModel):
 @router.post("/api/chat")
 async def chat(request: ChatRequest):
     orchestrator = Orchestrator()
-    try:
-        result = await orchestrator.run(request.model_dump())
-        return result
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    job = orchestrator.start(request.model_dump())
+    return {"job_id": job["id"], "status": job["status"], "progress": job["progress"]}
+
+
+@router.get("/api/jobs/{job_id}")
+async def job_status(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job non trovato")
+    return job
 
 
 @router.get("/api/health")

@@ -1,6 +1,9 @@
 const button = document.getElementById("generate");
 const status = document.getElementById("status");
 const log = document.getElementById("log");
+const progressFill = document.getElementById("progress-fill");
+const progressText = document.getElementById("progress-text");
+const currentStep = document.getElementById("current-step");
 
 function addLog(text) {
   const line = document.createElement("div");
@@ -10,10 +13,17 @@ function addLog(text) {
   log.scrollTop = log.scrollHeight;
 }
 
+function updateProgress(job) {
+  progressFill.style.width = job.progress + "%";
+  progressText.textContent = job.progress + "%";
+  currentStep.textContent = job.current_step;
+  status.textContent = job.status === "completed" ? "Completato" : "In corso";
+}
+
 button.addEventListener("click", async () => {
   button.disabled = true;
-  status.textContent = "Generazione in corso…";
-  addLog("Avvio pipeline…");
+  status.textContent = "Avvio…";
+  log.innerHTML = "";
 
   try {
     const response = await fetch("/api/chat", {
@@ -28,20 +38,36 @@ button.addEventListener("click", async () => {
     });
 
     const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Errore durante l’avvio");
 
-    if (!response.ok) {
-      throw new Error(data.detail || "Errore durante la generazione");
-    }
+    addLog("Job avviato: " + data.job_id);
 
-    addLog("Progetto: " + data.project_id);
-    addLog("Video YouTube: " + data.youtube_video);
-    addLog("Clip TikTok: " + data.tiktok_clips.length);
-    addLog("Stato: completato");
-    status.textContent = "Completato";
+    const interval = setInterval(async () => {
+      const statusResponse = await fetch("/api/jobs/" + data.job_id);
+      const job = await statusResponse.json();
+
+      updateProgress(job);
+      log.innerHTML = "";
+      job.logs.forEach(addLog);
+
+      if (job.status === "completed") {
+        clearInterval(interval);
+        button.disabled = false;
+        addLog("Video YouTube: " + job.result.youtube_video);
+        addLog("Clip TikTok generate: " + job.result.tiktok_clips.length);
+      }
+
+      if (job.status === "failed") {
+        clearInterval(interval);
+        button.disabled = false;
+        status.textContent = "Errore";
+        addLog("Errore: " + job.error);
+      }
+    }, 1500);
+
   } catch (error) {
-    addLog("Errore: " + error.message);
     status.textContent = "Errore";
-  } finally {
+    addLog("Errore: " + error.message);
     button.disabled = false;
   }
 });

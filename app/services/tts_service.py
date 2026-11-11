@@ -1,20 +1,33 @@
 import asyncio
 from pathlib import Path
 
-import edge_tts
+import pyttsx3
 
 
 class TTSService:
-    def __init__(self, voice: str = "it-IT-ElsaNeural"):
+    def __init__(self, voice: str | None = None):
         self.voice = voice
 
     async def generate_narration(self, script: str, output_path: Path):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         text = self._clean_script(script)
-
-        communicate = edge_tts.Communicate(text, self.voice)
-        await communicate.save(str(output_path))
+        await asyncio.to_thread(self._synthesize, text, output_path)
         return output_path
+
+    def _synthesize(self, text: str, output_path: Path):
+        engine = pyttsx3.init()
+        engine.setProperty("rate", 165)
+        engine.setProperty("volume", 1.0)
+
+        if self.voice:
+            voices = engine.getProperty("voices")
+            for voice in voices:
+                if self.voice.lower() in voice.id.lower() or self.voice.lower() in voice.name.lower():
+                    engine.setProperty("voice", voice.id)
+                    break
+
+        engine.save_to_file(text, str(output_path))
+        engine.runAndWait()
 
     @staticmethod
     def _clean_script(script: str):
