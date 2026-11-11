@@ -1,0 +1,31 @@
+app:
+  host: 127.0.0.1
+  port: 8000
+
+llm:
+  base_url: http://127.0.0.1:1234/v1
+  api_key: lm-studio
+  model: local-model
+  temperature: 0.8
+  max_tokens: 4096
+
+video:
+  youtube_duration_minutes: 12
+  tiktok_clips: 4
+  tiktok_min_duration: 35
+  tiktok_max_duration: 60
+  width: 1080
+  height: 1920
+  fps: 30
+
+voice:
+  provider: edge_tts
+  voice: it-IT-ElsaNeural
+  rate: -4%
+  volume: +0%
+
+visual:
+  style: motion_comic_dark
+  background_color: "#0b0b12"
+  text_color: "#ffffff"
+  highlight_color: "#ffd166"

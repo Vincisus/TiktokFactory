@@ -1,0 +1,62 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #0b0b12;
+  color: #f5f5f5;
+}
+
+.app {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 32px 20px;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 2rem;
+}
+
+header p {
+  color: #9aa0aa;
+}
+
+.controls {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  margin: 28px 0;
+}
+
+button {
+  background: #ffd166;
+  color: #111;
+  border: 0;
+  padding: 14px 22px;
+  border-radius: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+.log {
+  background: #14141d;
+  border: 1px solid #2a2a38;
+  border-radius: 12px;
+  padding: 18px;
+  min-height: 300px;
+  overflow-y: auto;
+}
+
+.line {
+  padding: 6px 0;
+  border-bottom: 1px solid #22222e;
+  font-size: .95rem;
+}
