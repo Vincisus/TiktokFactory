@@ -86,9 +86,12 @@ class Orchestrator:
             storyboard = await self.brain.generate_storyboard(script, structure, brief)
             self._save(project_dir / "storyboard.json", storyboard)
             update(55, "Generazione voce locale")
-            audio_path = await self.tts.generate_narration(script, project_dir / "audio" / "narration.mp3")
+            audio_path = await self.tts.generate_narration(script, project_dir / "audio" / "narration.wav")
+            audio_duration = self.tts.duration_seconds(audio_path)
+            if audio_duration <= 0:
+                raise ValueError("La voce generata ha durata nulla.")
             update(63, "Creazione sottotitoli con tempi stimati")
-            subtitle_path = self.subtitles.create_srt_from_script(script, project_dir / "subtitles" / "narration.srt", target_duration=brief["duration_minutes"] * 60)
+            subtitle_path = self.subtitles.create_srt_from_script(script, project_dir / "subtitles" / "narration.srt", target_duration=audio_duration)
             update(72, "Rendering video di prova")
             render_path = await asyncio.to_thread(run_async_service, self.renderer.render_story_video, storyboard=storyboard, audio_path=audio_path, subtitle_path=subtitle_path, output_path=project_dir / "render" / "youtube_video.mp4", duration_seconds=brief["duration_minutes"] * 60)
             update(84, "Creazione clip TikTok")
@@ -97,7 +100,7 @@ class Orchestrator:
             metadata = await self.metadata.generate_metadata(concept, structure)
             self._save(project_dir / "metadata.json", metadata)
             update(97, "Controllo qualita")
-            report = await asyncio.to_thread(self.qc.evaluate, render_path=render_path, clips=clips, structure=structure, min_duration=brief["duration_minutes"] * 60)
+            report = await asyncio.to_thread(self.qc.evaluate, render_path=render_path, clips=clips, structure=structure, min_duration=brief["duration_minutes"] * 60, required_clips=brief["tiktok_clips"])
             self._save(project_dir / "quality_report.json", report)
             job["result"] = {"project_id": project_id, "project_dir": str(project_dir), "youtube_video": str(render_path), "tiktok_clips": [str(path) for path in clips], "quality_report": report, "metadata": metadata}
             if report.get("issues"):
