@@ -3,51 +3,34 @@ from pathlib import Path
 
 
 class SubtitleService:
-    def create_srt_from_script(self, script: str, output_path: Path, target_duration: int):
+    def create_srt_from_script(self, script: str, output_path: Path, target_duration: float):
+        if target_duration <= 0:
+            raise ValueError("La durata dei sottotitoli deve essere positiva.")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        sentences = self._split_sentences(script)
-
-        if not sentences:
-            sentences = ["Storia non disponibile."]
-
-        total_chars = sum(len(sentence) for sentence in sentences)
-        if total_chars == 0:
-            total_chars = 1
-
-        durations = []
-        remaining = target_duration
-        for sentence in sentences:
-            share = len(sentence) / total_chars
-            duration = max(1.5, round(target_duration * share, 2))
-            durations.append(duration)
-
+        sentences = self._split_sentences(script) or ["Storia non disponibile."]
+        total_chars = max(1, sum(len(sentence) for sentence in sentences))
+        weights = [len(sentence) / total_chars for sentence in sentences]
+        durations = [max(min(1.0, target_duration / len(sentences)), target_duration * weight) for weight in weights]
         scale = target_duration / sum(durations)
         durations = [duration * scale for duration in durations]
-
-        srt_blocks = []
-        current = 0.0
+        blocks, current = [], 0.0
         for index, (sentence, duration) in enumerate(zip(sentences, durations), start=1):
             start = current
-            end = min(target_duration, current + duration)
+            end = target_duration if index == len(sentences) else min(target_duration, current + duration)
             current = end
-            srt_blocks.append(
-                f"{index}\n"
-                f"{self._format_timestamp(start)} --> {self._format_timestamp(end)}\n"
-                f"{sentence}\n"
-            )
-
-        output_path.write_text("\n".join(srt_blocks), encoding="utf-8")
+            blocks.append(f"{index}\n{self._format_timestamp(start)} --> {self._format_timestamp(end)}\n{sentence}\n")
+        output_path.write_text("\n".join(blocks), encoding="utf-8")
         return output_path
 
     @staticmethod
     def _split_sentences(script: str):
         text = re.sub(r"\s+", " ", script).strip()
-        parts = re.split(r"(?<=[.!?])\s+", text)
-        return [part.strip() for part in parts if part.strip()]
+        text = re.sub(r"(?m)^#{1,6}\s*", "", text)
+        return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
 
     @staticmethod
     def _format_timestamp(seconds: float):
-        milliseconds = int(round(seconds * 1000))
+        milliseconds = max(0, int(round(seconds * 1000)))
         hours, remainder = divmod(milliseconds, 3600000)
         minutes, remainder = divmod(remainder, 60000)
         secs, millis = divmod(remainder, 1000)

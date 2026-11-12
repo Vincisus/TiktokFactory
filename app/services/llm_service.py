@@ -1,4 +1,6 @@
+import ast
 import asyncio
+from copy import deepcopy
 import json
 import logging
 import os
@@ -7,7 +9,6 @@ import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
-
 import httpx
 from dotenv import load_dotenv
 
@@ -27,6 +28,22 @@ PART = obj({"part": {"type": "integer", "minimum": 1}, "title": S, "summary": S,
 CARD = obj({"scene_id": {"type": "integer", "minimum": 1}, "part": {"type": "integer", "minimum": 1}, "pov_id": S, "location": S, "characters_present": L, "facts": L, "knowledge_before": L, "knowledge_after": L, "withhold": L, "visual": S})
 
 
+def constrain_card(schema, prompt):
+    match = re.search(r"pov_id (?:tra|\(uno degli ID)\s*(\[[^\]\n]{1,2000}\])", prompt)
+    if not match:
+        raise ValueError("Elenco ID consentiti mancante nel prompt della scheda.")
+    try:
+        ids = ast.literal_eval(match.group(1))
+    except (ValueError, SyntaxError) as exc:
+        raise ValueError("Elenco ID non leggibile.") from exc
+    if not isinstance(ids, list) or not ids or not all(isinstance(x, str) and x.strip() for x in ids) or len(ids) != len(set(ids)):
+        raise ValueError("Elenco ID consentiti non valido.")
+    result = deepcopy(schema)
+    result["properties"]["pov_id"] = {"type": "string", "enum": ids}
+    result["properties"]["characters_present"] = {"type": "array", "minItems": 1, "items": {"type": "string", "enum": ids}}
+    return result
+
+
 def schema_for(prompt):
     if prompt.startswith("Sei un revisore."):
         return REVIEW
@@ -37,7 +54,7 @@ def schema_for(prompt):
         count = int(match.group(1)) if match else 4
         return obj({"parts": {"type": "array", "minItems": count, "maxItems": count, "items": PART}})
     if prompt.startswith("Genera la scheda della scena"):
-        return CARD
+        return constrain_card(CARD, prompt)
     return {"type": "object"}
 
 
@@ -46,6 +63,8 @@ def validate(value, schema, path="$ "):
     checks = {"object": lambda: isinstance(value, dict), "array": lambda: isinstance(value, list), "string": lambda: isinstance(value, str), "integer": lambda: type(value) is int, "boolean": lambda: type(value) is bool}
     if kind in checks and not checks[kind]():
         raise ValueError(f"{path}: atteso {kind}")
+    if "enum" in schema and value not in schema["enum"]:
+        raise ValueError(f"{path}: valore {value!r} non consentito; ammessi {schema['enum']!r}")
     if kind == "object":
         props = schema.get("properties", {})
         for key in schema.get("required", []):
@@ -85,11 +104,8 @@ class LLMService:
         call_id = uuid.uuid4().hex
         self.diagnostic_dir.mkdir(parents=True, exist_ok=True)
         diagnostic = self.diagnostic_dir / f"{call_id}.json"
-        content = []
-        finish = None
-        reasoning_chars = 0
-        started = time.monotonic()
-        last = started
+        content, finish, reasoning_chars = [], None, 0
+        started = last = time.monotonic()
         error = None
         payload = {"model": self.model, "messages": [{"role": "system", "content": "Rispondi in italiano. Fornisci solo il risultato finale richiesto, senza commenti editoriali."}, {"role": "user", "content": prompt}], "temperature": temperature, "max_tokens": int(os.getenv("LMSTUDIO_MAX_TOKENS", "4096")), "stream": True}
         if schema is not None:
@@ -140,7 +156,7 @@ class LLMService:
             error = f"{type(exc).__name__}: {exc}"
             raise RuntimeError(f"{error}. Diagnostica: {diagnostic}") from exc
         finally:
-            diagnostic.write_text(json.dumps({"model": self.model, "response": "".join(content), "finish_reason": finish, "reasoning_characters": reasoning_chars, "elapsed_seconds": round(time.monotonic()-started, 2), "error": error, "structured": schema is not None}, ensure_ascii=False, indent=2), encoding="utf-8")
+            diagnostic.write_text(json.dumps({"model": self.model, "response": "".join(content), "finish_reason": finish, "reasoning_characters": reasoning_chars, "elapsed_seconds": round(time.monotonic()-started, 2), "error": error, "structured": schema is not None, "schema": schema}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     async def generate_json(self, prompt):
         schema = schema_for(prompt)
