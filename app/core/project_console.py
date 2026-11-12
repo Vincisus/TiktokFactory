@@ -4,8 +4,6 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
-
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from app.core.orchestrator import job_store
@@ -114,11 +112,11 @@ async def run_resume(folder, job, lock):
         brief, concept, structure = [load(folder / name) for name in ("brief.json", "concept.json", "structure.json")]
         llm = LLMService()
         brain = StoryBrain(llm)
-        if not hasattr(brain, "prepare_recovery_card"):
-            raise RuntimeError("Motore di recupero non installato. Avvia con Avvia.bat per completare la configurazione automatica.")
+        if not callable(getattr(brain, "prepare_card", None)):
+            raise RuntimeError("Motore scene non aggiornato. Installa tutti i file dell'ultimo branch fix/video-pipeline-2026-11 e riavvia il server.")
         brain.on_progress = update
         job["status"] = "running"
-        update("Ripresa dal piano salvato; scrittura e storyboard", 10)
+        update("Ripresa con motore scene aggiornato; verifica checkpoint e piano salvato", 10)
         script = await brain.generate_script(concept, structure, brief)
         save(folder / "storyboard.json", await brain.generate_storyboard(script, structure, brief))
         (folder / "script.md").write_text(script, encoding="utf-8")
