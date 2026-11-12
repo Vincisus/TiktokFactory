@@ -14,12 +14,29 @@ class ChatRequest(BaseModel):
     tiktok_clips: int = Field(default=4, ge=3, le=4)
 
 
+class MediaResumeRequest(BaseModel):
+    project_id: str = Field(min_length=1, max_length=100)
+    tiktok_clips: int = Field(default=4, ge=3, le=4)
+
+
 @router.post("/api/chat")
 async def chat(payload: ChatRequest, request: Request):
     guard(request)
     if busy():
         raise HTTPException(409, "Un lavoro e gia attivo. Attendi che termini.")
     job = Orchestrator().start(payload.model_dump())
+    return {"job_id": job["id"], "status": job["status"], "progress": job["progress"]}
+
+
+@router.post("/api/resume-media")
+async def resume_media(payload: MediaResumeRequest, request: Request):
+    guard(request)
+    if busy():
+        raise HTTPException(409, "Un lavoro e gia attivo. Attendi che termini.")
+    try:
+        job = Orchestrator().start_media(payload.project_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return {"job_id": job["id"], "status": job["status"], "progress": job["progress"]}
 
 

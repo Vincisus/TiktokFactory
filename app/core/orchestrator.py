@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -37,16 +38,61 @@ class Orchestrator:
         self.qc = QualityControl()
 
     def health(self):
-        return {"status": "ok", "llm_configured": bool(self.llm.base_url), "ffmpeg_available": self.renderer.ffmpeg_available(), "note": "Non verifica una generazione reale del modello."}
+        return {
+            "status": "ok",
+            "llm_configured": bool(self.llm.base_url),
+            "ffmpeg_available": self.renderer.ffmpeg_available(),
+            "note": "Non verifica una generazione reale del modello.",
+        }
 
     def start(self, request):
         job_id = uuid.uuid4().hex
-        job = {"id": job_id, "status": "queued", "progress": 0, "current_step": "In coda", "logs": [], "result": None, "error": None, "created_at": datetime.now().isoformat()}
+        job = self._new_job(job_id)
         job_store[job_id] = job
         task = asyncio.create_task(self._run(job_id, request))
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
         return job
+
+    def start_media(self, project_id):
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", project_id):
+            raise ValueError("ID progetto non valido.")
+        project_dir = Path("projects") / project_id
+        required = [
+            project_dir / "brief.json",
+            project_dir / "concept.json",
+            project_dir / "structure.json",
+            project_dir / "storyboard.json",
+            project_dir / "narrative_manifest.json",
+        ]
+        missing = [path.name for path in required if not path.is_file()]
+        if missing:
+            raise ValueError("File mancanti per la ripresa voce/video: " + ", ".join(missing))
+        script_path = project_dir / "script.md"
+        if not script_path.is_file():
+            script_path = project_dir / "script_partial.md"
+        if not script_path.is_file():
+            raise ValueError("Copione completato non trovato.")
+        job_id = uuid.uuid4().hex
+        job = self._new_job(job_id)
+        job["project_dir"] = str(project_dir)
+        job_store[job_id] = job
+        task = asyncio.create_task(self._run_media(job_id, project_id, script_path))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return job
+
+    def _new_job(self, job_id):
+        return {
+            "id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "current_step": "In coda",
+            "logs": [],
+            "result": None,
+            "error": None,
+            "created_at": datetime.now().isoformat(),
+        }
 
     async def _run(self, job_id, request):
         job = job_store[job_id]
@@ -71,7 +117,14 @@ class Orchestrator:
             project_dir.mkdir(parents=True, exist_ok=True)
             job["project_dir"] = str(project_dir)
             update(5, "Creazione progetto")
-            brief = {"id": project_id, "request": request, "series": request.get("series", "tradimenti_e_vendetta"), "duration_minutes": max(10, int(request.get("duration_minutes", 12))), "tiktok_clips": min(4, max(3, int(request.get("tiktok_clips", 4)))), "language": "it"}
+            brief = {
+                "id": project_id,
+                "request": request,
+                "series": request.get("series", "tradimenti_e_vendetta"),
+                "duration_minutes": max(10, int(request.get("duration_minutes", 12))),
+                "tiktok_clips": min(4, max(3, int(request.get("tiktok_clips", 4)))),
+                "language": "it",
+            }
             self._save(project_dir / "brief.json", brief)
             update(12, "Pianificazione e revisione concept")
             concept = await self.planner.generate_concept(brief, project_dir)
@@ -85,33 +138,108 @@ class Orchestrator:
             update(45, "Creazione storyboard con durate stimate")
             storyboard = await self.brain.generate_storyboard(script, structure, brief)
             self._save(project_dir / "storyboard.json", storyboard)
-            update(55, "Generazione voce locale")
-            audio_path = await self.tts.generate_narration(script, project_dir / "audio" / "narration.wav")
-            audio_duration = self.tts.duration_seconds(audio_path)
-            if audio_duration <= 0:
-                raise ValueError("La voce generata ha durata nulla.")
-            update(63, "Creazione sottotitoli con tempi stimati")
-            subtitle_path = self.subtitles.create_srt_from_script(script, project_dir / "subtitles" / "narration.srt", target_duration=audio_duration)
-            update(72, "Rendering video di prova")
-            render_path = await asyncio.to_thread(run_async_service, self.renderer.render_story_video, storyboard=storyboard, audio_path=audio_path, subtitle_path=subtitle_path, output_path=project_dir / "render" / "youtube_video.mp4", duration_seconds=brief["duration_minutes"] * 60)
-            update(84, "Creazione clip TikTok")
-            clips = await asyncio.to_thread(run_async_service, self.tiktok.create_clips, render_path=render_path, structure=structure, output_dir=project_dir / "tiktok", clips_requested=brief["tiktok_clips"])
-            update(92, "Generazione metadati")
-            metadata = await self.metadata.generate_metadata(concept, structure)
-            self._save(project_dir / "metadata.json", metadata)
-            update(97, "Controllo qualita")
-            report = await asyncio.to_thread(self.qc.evaluate, render_path=render_path, clips=clips, structure=structure, min_duration=brief["duration_minutes"] * 60, required_clips=brief["tiktok_clips"])
-            self._save(project_dir / "quality_report.json", report)
-            job["result"] = {"project_id": project_id, "project_dir": str(project_dir), "youtube_video": str(render_path), "tiktok_clips": [str(path) for path in clips], "quality_report": report, "metadata": metadata}
-            if report.get("issues"):
-                raise ValueError("Controllo qualita non superato: " + "; ".join(report["issues"]))
-            job["status"] = "completed"
-            update(100, "Completato: controllare manualmente il risultato")
+            await self._produce_media(job, project_dir, script, structure, storyboard, brief, update)
         except Exception as exc:
             logger.exception("Pipeline interrotta")
             job["status"] = "failed"
             job["error"] = f"{type(exc).__name__}: {exc}"
             update(job["progress"], "Interrotto: " + job["error"])
+
+    async def _run_media(self, job_id, project_id, script_path):
+        job = job_store[job_id]
+        job["status"] = "running"
+        project_dir = Path("projects") / project_id
+
+        def persist():
+            self._save(project_dir / "job_status.json", job)
+
+        def update(progress, step):
+            job["progress"] = progress
+            job["current_step"] = step
+            job["logs"].append(f"[{datetime.now().strftime('%H:%M:%S')}] {step}")
+            persist()
+
+        try:
+            brief = self._load(project_dir / "brief.json")
+            structure = self._load(project_dir / "structure.json")
+            storyboard = self._load(project_dir / "storyboard.json")
+            script = script_path.read_text(encoding="utf-8").strip()
+            if not script:
+                raise ValueError("Il copione salvato è vuoto.")
+            await self._produce_media(job, project_dir, script, structure, storyboard, brief, update)
+        except Exception as exc:
+            logger.exception("Ripresa voce/video interrotta")
+            job["status"] = "failed"
+            job["error"] = f"{type(exc).__name__}: {exc}"
+            update(job["progress"], "Interrotto: " + job["error"])
+
+    async def _produce_media(self, job, project_dir, script, structure, storyboard, brief, update):
+        update(55, "Generazione voce locale")
+        audio_path = await self.tts.generate_narration(
+            script,
+            project_dir / "audio" / "narrazione.wav",
+        )
+        audio_duration = self.tts.duration_seconds(audio_path)
+        if audio_duration <= 0:
+            raise ValueError("La voce generata ha durata nulla.")
+        update(63, "Creazione sottotitoli")
+        subtitle_path = self.subtitles.create_srt_from_script(
+            script,
+            project_dir / "sottotitoli" / "narrazione.srt",
+            target_duration=audio_duration,
+        )
+        update(72, "Rendering video completo")
+        render_path = await asyncio.to_thread(
+            run_async_service,
+            self.renderer.render_story_video,
+            storyboard=storyboard,
+            audio_path=audio_path,
+            subtitle_path=subtitle_path,
+            output_path=project_dir / "video" / "youtube_video.mp4",
+            duration_seconds=audio_duration,
+        )
+        clips_requested = min(4, max(3, int(brief.get("tiktok_clips", 4))))
+        update(84, "Creazione clip TikTok")
+        clips = await asyncio.to_thread(
+            run_async_service,
+            self.tiktok.create_clips,
+            render_path=render_path,
+            structure=structure,
+            output_dir=project_dir / "tiktok",
+            clips_requested=clips_requested,
+        )
+        update(92, "Generazione metadati")
+        concept = self._load(project_dir / "concept.json")
+        metadata = await self.metadata.generate_metadata(concept, structure)
+        self._save(project_dir / "metadata.json", metadata)
+        update(97, "Controllo qualità")
+        report = await asyncio.to_thread(
+            self.qc.evaluate,
+            render_path=render_path,
+            clips=clips,
+            structure=structure,
+            min_duration=audio_duration,
+            required_clips=clips_requested,
+        )
+        self._save(project_dir / "quality_report.json", report)
+        job["result"] = {
+            "project_id": brief["id"],
+            "project_dir": str(project_dir),
+            "audio": str(audio_path),
+            "subtitles": str(subtitle_path),
+            "youtube_video": str(render_path),
+            "tiktok_clips": [str(path) for path in clips],
+            "quality_report": report,
+            "metadata": metadata,
+        }
+        if report.get("issues"):
+            raise ValueError("Controllo qualità non superato: " + "; ".join(report["issues"]))
+        job["status"] = "completed"
+        update(100, "Completato: voce, video e clip TikTok generati")
+
+    @staticmethod
+    def _load(path):
+        return json.loads(path.read_text(encoding="utf-8"))
 
     @staticmethod
     def _save(path, data):
