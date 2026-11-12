@@ -1,12 +1,16 @@
+import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
+import uuid
 from pathlib import Path
 from app.core.planning_service import PlanningService
+from app.core.scene_policy import review_scene, writer_prompt
 
 logger = logging.getLogger("uvicorn.error")
-POLICY = "scene-repair-v2"
+POLICY = "scene-evidence-v3"
 
 
 def word_count(text):
@@ -30,32 +34,28 @@ def validate_parts(value, expected):
 
 
 def validate_card(card, known_ids, number):
-    if type(card.get("scene_id")) is not int or card["scene_id"] != number:
+    if not isinstance(card, dict) or type(card.get("scene_id")) is not int or card["scene_id"] != number:
         raise ValueError("Identificatore scena non valido.")
     if card.get("pov_id") not in known_ids:
         raise ValueError("Punto di vista sconosciuto.")
-    if not isinstance(card.get("location"), str) or not card["location"].strip():
-        raise ValueError("Luogo della scena mancante.")
+    for key in ("location", "visual"):
+        if not isinstance(card.get(key), str) or not card[key].strip():
+            raise ValueError(f"Scena: manca {key}.")
     for key in ("facts", "knowledge_before", "knowledge_after"):
-        items = card.get(key)
-        if not isinstance(items, list) or not items or not all(isinstance(x, str) and x.strip() for x in items):
-            raise ValueError(f"Scena {number}: {key} non valido.")
+        values = card.get(key)
+        if not isinstance(values, list) or not values or not all(isinstance(x, str) and x.strip() for x in values):
+            raise ValueError(f"Scena: {key} non valido.")
     present = card.get("characters_present")
-    if not isinstance(present, list) or not present or any(x not in known_ids for x in present):
+    if not isinstance(present, list) or not present or any(x not in known_ids for x in present) or card["pov_id"] not in present:
         raise ValueError("Personaggi presenti non validi.")
-    if card["pov_id"] not in present:
-        raise ValueError("Il narratore deve essere presente nella scena.")
     if not isinstance(card.get("withhold"), list) or not all(isinstance(x, str) for x in card["withhold"]):
         raise ValueError("Campo withhold non valido.")
-    if not isinstance(card.get("visual"), str) or not card["visual"].strip():
-        raise ValueError("Descrizione visiva mancante.")
     return card
 
 
 class StoryBrain:
     def __init__(self, llm):
-        self.llm = llm
-        self.on_progress = None
+        self.llm, self.on_progress = llm, None
 
     def notify(self, text):
         logger.info(text)
@@ -83,31 +83,36 @@ class StoryBrain:
         return await PlanningService(self.llm).generate_structure(concept, brief, self.folder(brief))
 
     async def review(self, data, kind):
+        if "card" in data:
+            return await review_scene(self.llm, data)
         planner = PlanningService(self.llm)
         planner.on_progress = self.on_progress
-        return await planner.review(data, {"rules": "characters_present contiene solo persone fisicamente presenti. Persone citate, autori di messaggi e interlocutori remoti non devono essere aggiunti se assenti. Nei facts ogni comunicazione decisiva deve rendere ricostruibili mittente, destinatario e contenuto. Non inventare presenze per risolvere un rilievo. knowledge_before precede i fatti; knowledge_after puo derivare dai fatti correnti. withhold non vieta al narratore di esprimere pensieri gia acquisiti. Non rifiutare una semplice menzione di un personaggio assente."}, kind)
+        return await planner.review(data, {"rules": "Verifica continuita, identita, causalita e risoluzione; non inventare problemi."}, kind)
 
-    async def prepare_card(self, folder, number, part, beat, ids, concept, structure, state):
+    async def prepare_card(self, folder, number, part, beat, ids, concept, structure, state, feedback=None):
         base = (
             f"Genera la scheda della scena {number}, segmento {beat}/3 della parte {part['part']}. "
             f"Concept: {json.dumps(concept, ensure_ascii=False)}. Piano: {json.dumps(structure, ensure_ascii=False)}. "
-            f"Fatti precedenti: {json.dumps(state, ensure_ascii=False)}. "
-            "Una sola azione centrale con passaggi necessari espliciti. Non ripetere eventi conclusi. "
-            "Solo il segmento 3 conclude la parte. Ultima scena: risoluzione. "
-            "characters_present indica SOLO persone fisicamente presenti, non persone citate o remote. "
-            "Nei facts specifica per messaggi e telefonate decisivi CHI comunica, A CHI, e COSA. "
-            "Un autore assente puo essere nominato nei facts senza entrare in characters_present. "
-            "Non inventare persone presenti. Mantieni convinzioni distinte dai fatti. "
+            f"Fatti precedenti VINCOLANTI: {json.dumps(state, ensure_ascii=False)}. "
+            "Una sola azione nuova e concreta. Non ripetere scoperte concluse. Se si riesamina una prova, "
+            "dichiaralo senza cambiare chi vi compare. knowledge_after deriva solo da facts o fatti precedenti. "
+            "Non inserire decisioni/azioni nuove soltanto in knowledge_after. Ogni foto ha soggetti coerenti. "
+            "Solo segmento 3 conclude la parte; solo ultima scena risolve la storia. "
+            "characters_present: solo persone fisicamente presenti. Nei facts chiarisci chi comunica a chi e cosa. "
+            "Non confondere verita fattuale e dolore personale. withhold: solo informazioni specifiche "
+            "non comunicate a un destinatario; non istruzioni vaghe o azioni da nascondere al lettore. "
             f"JSON: scene_id={number}, part={part['part']}, pov_id tra {ids}, location, "
-            "characters_present (ID), facts, knowledge_before, knowledge_after, withhold (liste di stringhe), visual. "
-            "Massimo 5 elementi per lista, 30 parole per elemento."
+            "characters_present (ID), facts, knowledge_before, knowledge_after, withhold (liste), visual. "
+            "Massimo 5 elementi per lista e 30 parole per elemento."
         )
-        prompt = base
+        prompt = base + ("\nProblemi da risolvere senza cambiare fatti precedenti: " + json.dumps(feedback, ensure_ascii=False) if feedback else "")
+        run = uuid.uuid4().hex[:10]
         issues = []
         for attempt in range(3):
-            self.notify(f"Scena {number}: scheda e revisione, tentativo {attempt + 1}/3")
+            self.notify(f"Scena {number}: scheda con evidenze, tentativo {attempt+1}/3")
             card = await self.llm.generate_json(prompt)
-            self.save(folder / "scenes" / f"{number:03}_card_draft_{attempt + 1}.json", card)
+            prefix = folder / "scenes" / f"{number:03}_{run}_card_{attempt+1}"
+            self.save(prefix.with_suffix(".json"), card)
             try:
                 validate_card(card, ids, number)
                 if card.get("part") != part["part"]:
@@ -116,14 +121,43 @@ class StoryBrain:
                 report = {"ok": False, "issues": [str(exc)]}
             else:
                 report = await self.review({"concept": concept, "structure": structure, "previous_facts": state, "card": card}, "scheda scena")
-            self.save(folder / "scenes" / f"{number:03}_card_review_{attempt + 1}.json", report)
+            self.save(prefix.with_name(prefix.name + "_review.json"), report)
             issues = report["issues"]
             if report["ok"]:
                 self.save(folder / "scenes" / f"{number:03}_card.json", card)
                 self.save(folder / "scenes" / f"{number:03}_card_review.json", report)
                 return card
-            prompt = base + "\nRicostruisci coerentemente la scheda correggendo solo i problemi reali. Non aggiungere una presenza fisica se la persona e solo menzionata. Aggiorna tutte le conseguenze dei fatti modificati. " + f"Bozza: {json.dumps(card, ensure_ascii=False)}. Problemi: {json.dumps(issues, ensure_ascii=False)}"
-        raise ValueError(f"Scena {number}: scheda rifiutata dopo due correzioni: " + "; ".join(issues))
+            prompt = base + "\nRicostruisci la scheda risolvendo i problemi, non modificare scene precedenti. " + json.dumps({"draft": card, "issues": report}, ensure_ascii=False)
+        raise ValueError(f"Scena {number}: scheda non approvata: " + "; ".join(issues))
+
+    async def write_scene(self, folder, number, part, beat, ids, concept, structure, state, previous, bounds):
+        minimum, maximum, target = bounds
+        card = await self.prepare_card(folder, number, part, beat, ids, concept, structure, state)
+        errors, text, repairs = [], "", 0
+        attempts = max(1, min(10, int(os.getenv("SCENE_TEXT_ATTEMPTS", "6"))))
+        run = uuid.uuid4().hex[:10]
+        for attempt in range(attempts):
+            self.notify(f"Scena {number}: narrazione con stato condiviso, tentativo {attempt+1}/{attempts}")
+            prompt = writer_prompt(concept, card, state, previous, minimum, maximum, target)
+            if errors:
+                prompt += "\nCorreggi questa bozza senza conservare errori: " + json.dumps({"text": text, "issues": errors}, ensure_ascii=False)
+            text = (await self.llm.generate_text(prompt)).strip()
+            prefix = folder / "scenes" / f"{number:03}_{run}_text_{attempt+1}"
+            self.save(prefix.with_suffix(".txt"), text)
+            report = await self.review({"concept": concept, "structure": structure, "previous_facts": state, "card": card, "text": text}, "narrazione")
+            count = word_count(text)
+            errors = list(report["issues"])
+            if not minimum <= count <= maximum:
+                errors.append(f"Lunghezza {count}: richieste {minimum}-{maximum} parole.")
+            self.save(prefix.with_name(prefix.name + "_review.json"), {**report, "ok": not errors, "issues": errors, "word_count": count})
+            if not errors:
+                return card, text
+            if any(i["target"] == "card" for i in report.get("details", [])) and repairs < 2 and attempt+1 < attempts:
+                repairs += 1
+                self.notify(f"Scena {number}: difetto nei vincoli; ricostruzione scheda {repairs}/2")
+                card = await self.prepare_card(folder, number, part, beat, ids, concept, structure, state, {"card": card, "review": report})
+                text, errors = "", []
+        raise ValueError(f"Scena {number}: narrazione non approvata dopo {attempts} tentativi: " + "; ".join(errors))
 
     async def generate_script(self, concept, structure, brief):
         folder = self.folder(brief)
@@ -132,13 +166,8 @@ class StoryBrain:
         ids = [c["id"] for c in concept["characters"]]
         plan_hash = digest({"concept": concept, "structure": structure, "duration": brief["duration_minutes"], "policy": POLICY})
         state, approved, cards = [], [], []
-        target = max(100, round(brief["duration_minutes"] * 60 / (len(parts) * 3) * 2.5))
-        minimum, maximum = int(target * .75), int(target * 1.3)
-        legacy_plan_matches = False
-        try:
-            legacy_plan_matches = json.loads((folder / "concept.json").read_text(encoding="utf-8")) == concept and json.loads((folder / "structure.json").read_text(encoding="utf-8")) == structure
-        except (OSError, ValueError):
-            pass
+        target = max(100, round(brief["duration_minutes"] * 60 / (len(parts)*3) * 2.5))
+        bounds = (int(target*.75), int(target*1.3), target)
         number = 0
         for part in parts:
             for beat in range(1, 4):
@@ -154,47 +183,30 @@ class StoryBrain:
                         candidate = json.loads(card_path.read_text(encoding="utf-8"))
                         candidate_text = text_path.read_text(encoding="utf-8")
                         validate_card(candidate, ids, number)
-                        if candidate.get("part") != part["part"] or not minimum <= word_count(candidate_text) <= maximum:
-                            raise ValueError("Checkpoint incompatibile con parte o lunghezza.")
+                        if candidate.get("part") != part["part"] or not bounds[0] <= word_count(candidate_text) <= bounds[1]:
+                            raise ValueError("Checkpoint incompatibile.")
                         binding = {"context": context_hash, "card": digest(candidate), "text": hashlib.sha256(candidate_text.encode()).hexdigest()}
-                        if checkpoint.is_file():
-                            reused = json.loads(checkpoint.read_text(encoding="utf-8")) == binding
-                        elif legacy_plan_matches:
-                            self.notify(f"Scena {number}: verifica checkpoint precedente prima del riutilizzo")
-                            card_report = await self.review({"concept": concept, "structure": structure, "previous_facts": state, "card": candidate}, "checkpoint scheda scena")
-                            text_report = await self.review({"characters": concept["characters"], "card": candidate, "previous_facts": state, "text": candidate_text}, "checkpoint narrazione")
-                            self.save(prefix.with_name(prefix.name + "_migration_review.json"), {"card": card_report, "text": text_report})
-                            reused = card_report["ok"] and text_report["ok"]
+                        reused = checkpoint.is_file() and json.loads(checkpoint.read_text(encoding="utf-8")) == binding
+                        if not reused:
+                            self.notify(f"Scena {number}: nuova verifica con evidenze del materiale salvato")
+                            c = await self.review({"concept": concept, "structure": structure, "previous_facts": state, "card": candidate}, "checkpoint scheda")
+                            t = await self.review({"concept": concept, "structure": structure, "previous_facts": state, "card": candidate, "text": candidate_text}, "checkpoint testo")
+                            self.save(prefix.with_name(prefix.name + "_evidence_migration.json"), {"card": c, "text": t})
+                            reused = c["ok"] and t["ok"]
                         if reused:
                             card, text = candidate, candidate_text
                             self.notify(f"Scena {number}: checkpoint verificato, nessuna riscrittura")
                     except (OSError, ValueError) as exc:
                         self.notify(f"Scena {number}: checkpoint non riutilizzabile: {exc}")
                 if not reused:
-                    card = await self.prepare_card(folder, number, part, beat, ids, concept, structure, state)
-                    errors = []
-                    for attempt in range(3):
-                        self.notify(f"Scena {number}/{len(parts)*3}: scrittura e revisione, tentativo {attempt+1}/3")
-                        prompt = (
-                            f"Scrivi solo narrazione italiana in prima persona, {minimum}-{maximum} parole, obiettivo {target}. "
-                            "Rispetta esattamente la scheda e non anticipare withhold. Nessun titolo o commento. "
-                            "Non riassumere scene precedenti. Dialoghi naturali. Persone solo menzionate non sono presenti. "
-                            f"Personaggi: {json.dumps(concept['characters'], ensure_ascii=False)}. Scheda: {json.dumps(card, ensure_ascii=False)}. "
-                            f"Fine scena precedente: {approved[-1][-1000:] if approved else 'Inizio storia'}."
-                        )
-                        if attempt:
-                            prompt += f" Riscrivi la bozza correggendo questi problemi: {json.dumps(errors, ensure_ascii=False)}. Bozza: {text}"
-                        text = (await self.llm.generate_text(prompt)).strip()
-                        self.save(prefix.with_name(prefix.name + f"_draft_{attempt+1}.txt"), text)
-                        count = word_count(text)
-                        errors = [] if minimum <= count <= maximum else [f"Lunghezza {count}: richieste {minimum}-{maximum} parole."]
-                        report = await self.review({"characters": concept["characters"], "card": card, "previous_facts": state, "text": text}, "racconto della scena rispetto ai fatti vincolanti")
-                        errors.extend(report["issues"])
-                        self.save(prefix.with_name(prefix.name + f"_review_{attempt+1}.json"), {"word_count": count, "issues": errors, "ok": not errors})
-                        if not errors:
-                            break
-                    else:
-                        raise ValueError(f"Scena {number} non approvata dopo due correzioni: " + "; ".join(errors))
+                    for old in (card_path, text_path, checkpoint):
+                        if old.is_file():
+                            self.save(folder / "scenes" / "backups" / (uuid.uuid4().hex + "_" + old.name), old.read_text(encoding="utf-8"))
+                    try:
+                        async with asyncio.timeout(max(60, float(os.getenv("SCENE_TOTAL_TIMEOUT", "1800")))):
+                            card, text = await self.write_scene(folder, number, part, beat, ids, concept, structure, state, approved[-1][-1000:] if approved else "Inizio storia", bounds)
+                    except TimeoutError as exc:
+                        raise ValueError(f"Scena {number}: budget temporale esaurito, bozze e checkpoint precedenti conservati.") from exc
                 self.save(text_path, text)
                 self.save(checkpoint, {"context": context_hash, "card": digest(card), "text": hashlib.sha256(text.encode()).hexdigest()})
                 approved.append(text)
@@ -208,7 +220,7 @@ class StoryBrain:
         self.save(folder / "continuity_report.json", report)
         if not report["ok"]:
             raise ValueError("Continuita complessiva rifiutata: " + "; ".join(report["issues"]))
-        self.save(folder / "narrative_manifest.json", {"script_sha256": hashlib.sha256(script.encode()).hexdigest(), "scene_count": len(cards), "policy": POLICY, "note": "Revisione dello stesso LLM, non garanzia di qualita; durate stimate."})
+        self.save(folder / "narrative_manifest.json", {"script_sha256": hashlib.sha256(script.encode()).hexdigest(), "scene_count": len(cards), "policy": POLICY, "note": "Citazioni verificate non provano da sole la coerenza semantica; revisione dello stesso LLM."})
         return script
 
     async def generate_storyboard(self, script, structure, brief):
@@ -225,4 +237,4 @@ class StoryBrain:
             scenes.append({"scene_id": card["scene_id"], "part": card["part"], "start": current, "end": end, "narration": text, "visual": card.get("visual", card["location"]), "camera": "slow_zoom", "on_screen_text": "", "sound": "", "emotion": "", "image_prompt": "", "timing_source": "estimated_word_count"})
             current = end
         scenes[-1]["end"] = duration
-        return {"scenes": scenes, "timing_source": "estimated_word_count", "note": "Nessuna immagine generata da questo modulo. Allineamento audio reale non implementato."}
+        return {"scenes": scenes, "timing_source": "estimated_word_count", "note": "Immagini e allineamento audio reale non generati da questo modulo."}
