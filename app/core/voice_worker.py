@@ -1,0 +1,1 @@
+voce Windows italiana isolata

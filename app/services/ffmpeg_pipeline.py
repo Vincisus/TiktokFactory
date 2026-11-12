@@ -1,0 +1,1 @@
+pipeline FFmpeg con progressi, watchdog e validazione
