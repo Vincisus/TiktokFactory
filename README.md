@@ -2,7 +2,7 @@
 
 Applicazione locale per preparare racconti italiani con LM Studio. La pagina web elenca i progetti salvati, mostra i progressi, riprende la scrittura dal piano e propone cinque titoli.
 
-> Stato reale: la ripresa web completa **scrittura, storyboard e titoli**, non voce o video. Il pulsante Nuovo progetto prova anche la pipeline multimediale esistente, ancora da collaudare sul proprio PC. Durate e sottotitoli sono stimati. Questo aggiornamento non genera immagini o animazioni. Le revisioni dello stesso modello non garantiscono la qualita narrativa.
+> Stato reale: la modalità Lean produce soltanto narrazione e storyboard. Il pulsante Nuovo progetto usa la pipeline multimediale. Il renderer crea scene grafiche tipografiche (non immagini AI né animazioni complesse), incorpora sottotitoli SRT stimati e usa la durata effettiva della voce. Il collaudo finale va eseguito sul proprio PC Windows e con il modello LM Studio effettivo.
 
 ## 1. Prerequisiti
 
@@ -183,3 +183,10 @@ Dalla cartella del progetto, dopo la preparazione dell'ambiente:
 ```
 
 I test usano modelli simulati. Non verificano la qualita del modello reale o la produzione completa di video sul proprio Windows. L'aggiornamento web e stato controllato sintatticamente e tramite test isolati delle funzioni di recupero; il collaudo HTTP/browser e multimediale va eseguito nell'ambiente installato. Non sono garantiti tempi, durata audio effettiva, animazioni o sincronizzazione parola per parola.
+
+
+## Correzioni pipeline multimediale
+
+La pipeline ora verifica l'audio WAV prodotto da pyttsx3, calcola la durata reale, sincronizza i sottotitoli su tale durata, incorpora i sottotitoli nel video, chiude le risorse MoviePy, genera clip TikTok fino a 60 secondi e controlla decodifica, audio e durata dei file. Una durata inferiore al target è segnalata come avviso e non scarta un MP4 valido. Il renderer crea scene grafiche tipografiche: non genera immagini AI né animazioni 2D complesse. La modalità Lean resta narrativa e non produce video.
+
+Test: `.\.venv\Scripts\python.exe -m pytest tests -q`. I test automatici non sostituiscono una prova end-to-end con LM Studio, pyttsx3 e FFmpeg sul PC Windows.
